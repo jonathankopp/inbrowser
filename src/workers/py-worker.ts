@@ -91,71 +91,43 @@ print(f"Created dataframe with shape: {df.shape}")
     }
     
     if (data.type === 'exec') {
+      const dfName = data.dfName || 'sample_funds_xlsx_Sheet1';
       console.log('Executing Python code:', data.code);
       try {
-        // Instead of using the generated code, we'll use our reliable plotting code
         let code = `
 try:
-    # Convert 'date' column to datetime and ensure we have a clean DataFrame
-    df = sample_funds_xlsx_Sheet1.copy()
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date').reset_index(drop=True)
-    
-    # Calculate cumulative returns using compound growth
-    base_x = 100
-    base_y = 100
-    df['fund_x_cum'] = base_x
-    df['fund_y_cum'] = base_y
-    
-    # Calculate cumulative growth properly
-    for i in range(len(df)):
-        if i > 0:
-            df.loc[i, 'fund_x_cum'] = df.loc[i-1, 'fund_x_cum'] * (1 + df.loc[i, 'fund_x'] / 100)
-            df.loc[i, 'fund_y_cum'] = df.loc[i-1, 'fund_y_cum'] * (1 + df.loc[i, 'fund_y'] / 100)
-    
-    # Convert back to percentage growth from base 100
-    df['fund_x_cum'] = df['fund_x_cum'] - base_x
-    df['fund_y_cum'] = df['fund_y_cum'] - base_y
-    
-    # Create plot data
+    df = globals()['${dfName}'].copy()
+    # Sort by the first column if it's a date or year
+    x_col = df.columns[0]
+    if pd.api.types.is_datetime64_any_dtype(df[x_col]) or x_col.lower() in ['date', 'year']:
+        df[x_col] = pd.to_datetime(df[x_col], errors='ignore')
+        df = df.sort_values(x_col).reset_index(drop=True)
+    # Find all numeric columns except the first (x_col)
+    numeric_cols = [col for col in df.columns if col != x_col and pd.api.types.is_numeric_dtype(df[col])]
+    # Create plot data for all numeric columns
     plot_data = {
         'data': [
             {
-                'x': df['date'].dt.strftime('%Y-%m-%d').tolist(),
-                'y': df['fund_x_cum'].round(2).tolist(),
+                'x': df[x_col].astype(str).tolist(),
+                'y': df[col].tolist(),
                 'type': 'scatter',
                 'mode': 'lines+markers',
-                'name': 'Fund X',
-                'line': {'color': 'rgb(31, 119, 180)', 'width': 2},
-                'marker': {'size': 8}
-            },
-            {
-                'x': df['date'].dt.strftime('%Y-%m-%d').tolist(),
-                'y': df['fund_y_cum'].round(2).tolist(),
-                'type': 'scatter',
-                'mode': 'lines+markers',
-                'name': 'Fund Y',
-                'line': {'color': 'rgb(255, 127, 14)', 'width': 2},
-                'marker': {'size': 8}
-            }
+                'name': col
+            } for col in numeric_cols
         ],
         'layout': {
             'title': {
-                'text': 'Cumulative Fund Growth',
+                'text': 'Auto Chart',
                 'font': {'size': 24}
             },
             'xaxis': {
-                'title': 'Date',
+                'title': x_col,
                 'tickangle': -45,
                 'gridcolor': 'rgb(240, 240, 240)',
                 'showgrid': True
             },
             'yaxis': {
-                'title': 'Total Return (%)',
-                'tickformat': '+.1f',
-                'ticksuffix': '%',
-                'zeroline': True,
-                'zerolinecolor': 'rgb(200, 200, 200)',
+                'title': 'Value',
                 'gridcolor': 'rgb(240, 240, 240)',
                 'showgrid': True
             },
@@ -172,8 +144,6 @@ try:
             'margin': {'t': 50, 'b': 80, 'l': 60, 'r': 20}
         }
     }
-    
-    # Convert to JSON string
     result = json.dumps(plot_data)
 except Exception as e:
     print(f"Error executing code: {str(e)}")

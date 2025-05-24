@@ -427,40 +427,39 @@ Return the code as JSON in this format:
       const codeGenData = await codeGenResponse.json();
       console.log('Received code generation response:', codeGenData);
       
-      let codeGen: CodeGenResult;
-      try {
-        if (codeGenData.choices[0]?.message?.function_call?.arguments) {
-          const args = codeGenData.choices[0].message.function_call.arguments;
-          console.log('Parsing function arguments:', args);
-          if (args === '{}' || args === '') {
-            throw new Error('Code generator returned empty data');
+      for (const task of tasks) {
+        let codeGen: CodeGenResult;
+        try {
+          if (codeGenData.choices[0]?.message?.function_call?.arguments) {
+            const args = codeGenData.choices[0].message.function_call.arguments;
+            console.log('Parsing function arguments:', args);
+            if (args === '{}' || args === '') {
+              throw new Error('Code generator returned empty data');
+            }
+            codeGen = JSON.parse(args);
+          } else if (codeGenData.choices[0]?.message?.content) {
+            codeGen = JSON.parse(codeGenData.choices[0].message.content);
+          } else {
+            console.error('Invalid response structure:', codeGenData.choices[0]);
+            throw new Error('Response missing valid message structure');
           }
-          codeGen = JSON.parse(args);
-        } else if (codeGenData.choices[0]?.message?.content) {
-          codeGen = JSON.parse(codeGenData.choices[0].message.content);
-        } else {
-          console.error('Invalid response structure:', codeGenData.choices[0]);
-          throw new Error('Response missing valid message structure');
+          if (!codeGen.python || !codeGen.result_type) {
+            throw new Error('Generated code missing required fields');
+          }
+          console.log('Generated code:', codeGen);
+          // Execute the generated code
+          console.log('Executing Python code...');
+          pyWorkerRef.current?.postMessage({
+            type: 'exec',
+            code: codeGen.python,
+            resultType: codeGen.result_type,
+            dfName: `${task.fileId.replace(/[^a-z0-9]/gi, '_')}_${task.sheetId.replace(/[^a-z0-9]/gi, '_')}`
+          });
+        } catch (error) {
+          console.error('Error parsing code generation response:', error);
+          console.log('Raw code generation data:', codeGenData);
+          throw new Error(`Failed to parse code generation response: ${error instanceof Error ? error.message : String(error)}`);
         }
-        
-        if (!codeGen.python || !codeGen.result_type) {
-          throw new Error('Generated code missing required fields');
-        }
-        
-        console.log('Generated code:', codeGen);
-        
-        // Execute the generated code
-        console.log('Executing Python code...');
-        pyWorkerRef.current?.postMessage({
-          type: 'exec',
-          code: codeGen.python,
-          resultType: codeGen.result_type,
-          dfName: `${task.fileId.replace(/[^a-z0-9]/gi, '_')}_${task.sheetId.replace(/[^a-z0-9]/gi, '_')}`
-        });
-      } catch (error) {
-        console.error('Error parsing code generation response:', error);
-        console.log('Raw code generation data:', codeGenData);
-        throw new Error(`Failed to parse code generation response: ${error instanceof Error ? error.message : String(error)}`);
       }
       
     } catch (error) {
