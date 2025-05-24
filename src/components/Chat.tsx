@@ -1,0 +1,662 @@
+import { useState, useCallback, useRef, useEffect } from 'react';
+import type { SheetPNG, ExtractionTask, ExtractedRecord, CodeGenResult } from '../types';
+import html2canvas from 'html2canvas';
+
+interface ChatProps {
+  sheets: SheetPNG[];
+  onSheetsUpdate: (sheets: SheetPNG[]) => void;
+}
+
+export default function Chat({ sheets, onSheetsUpdate }: ChatProps) {
+  const [messages, setMessages] = useState<string[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const renderWorkerRef = useRef<Worker>();
+  const pyWorkerRef = useRef<Worker>();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const processFiles = useCallback(async (files: File[]) => {
+    try {
+      setIsProcessing(true);
+      console.log('Starting to process files:', files.map(f => f.name));
+
+      for (const file of files) {
+        if (!file.name.endsWith('.xlsx')) {
+          console.warn('Skipping non-Excel file:', file.name);
+          continue;
+        }
+        
+        console.log('Reading file as array buffer:', file.name);
+        const buffer = await file.arrayBuffer();
+        console.log('Successfully read file, size:', buffer.byteLength, 'bytes');
+        
+        console.log('Sending file to render worker:', file.name);
+        renderWorkerRef.current?.postMessage(
+          { type: 'render', fileId: file.name, buffer },
+          [buffer]
+        );
+        console.log('Message sent to render worker');
+      }
+    } catch (error) {
+      console.error('Error processing files:', error);
+      setMessages(prev => [...prev, `Error processing files: ${error instanceof Error ? error.message : String(error)}`]);
+    } finally {
+      setIsProcessing(false);
+    }
+  }, [setMessages]);
+
+  const handleFileDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files);
+    await processFiles(files);
+  }, [processFiles]);
+
+  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files?.length) return;
+    const files = Array.from(e.target.files);
+    await processFiles(files);
+    // Reset the input so the same file can be selected again
+    e.target.value = '';
+  }, [processFiles]);
+
+  const handleMessage = useCallback(async (message: string) => {
+    console.log('Processing message:', message);
+    if (!sheets.length) {
+      console.warn('No sheets loaded, cannot process message');
+      setMessages(prev => [...prev, message, 'Please drop an Excel file first']);
+      return;
+    }
+
+    setMessages(prev => [...prev, message]);
+    setIsProcessing(true);
+    
+    try {
+      console.log('Calling GPT-4.1 for planning...');
+      const plannerPrompt = {
+        model: 'gpt-4.1',
+        max_tokens: 1000,
+        function_call: { name: "extract_tasks" },
+        response_format: { type: "json_object" },
+        functions: [{
+          name: "extract_tasks",
+          description: "Extract tasks from Excel sheets based on user query",
+          parameters: {
+            type: "object",
+            properties: {
+              tasks: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    fileId: { type: "string" },
+                    sheetId: { type: "string" },
+                    purpose: { type: "string" },
+                    expectedSchema: { 
+                      type: "object",
+                      additionalProperties: { type: "string" }
+                    }
+                  },
+                  required: ["fileId", "sheetId", "purpose", "expectedSchema"]
+                }
+              }
+            },
+            required: ["tasks"]
+          }
+        }],
+        messages: [
+          {
+            role: 'system',
+            content: `You are a planner that looks at screenshots of Excel sheets and creates a set of tasks that describe exactly what data should be extracted from which file and sheet in order to answer the user's question.
+
+Each task should explain:
+- what the purpose of the data extraction is (what information you're trying to get),
+- which sheet the data is coming from (use the EXACT filename from the Excel file, e.g. "sample_funds.xlsx", NOT image names like "Sheet1.png"),
+- what the expected schema of the extracted data is (as a JSON object, where keys are column names and values are data types or formats).
+
+Always output a list of extraction tasks as structured JSON. Make sure to use the exact Excel filenames from the uploaded files, not image names or generic names.`
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `The user wants to: "${message}". 
+Here are images of the Excel sheets they uploaded. The Excel filename is "${sheets[0].fileId}" with sheet "${sheets[0].sheetId}". Figure out what specific data we need to extract to answer their question, and return a list of clearly defined extraction tasks as JSON.`
+              },
+              ...sheets.map(s => ({
+                type: 'image_url',
+                image_url: {
+                  url: s.pngUrl,
+                  detail: "high"
+                }
+              }))
+            ]
+          }
+        ]
+      };
+      console.log('Planning prompt:', plannerPrompt);
+      const plannerResponse = await fetch('/api/proxy/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${import.meta.env.VITE_OPENAI_KEY}`
+        },
+        body: JSON.stringify(plannerPrompt)
+      });
+
+      if (!plannerResponse.ok) {
+        throw new Error(`Planner API error: ${plannerResponse.status} - ${await plannerResponse.text()}`);
+      }
+      
+      const plannerData = await plannerResponse.json();
+      console.log('Received planner response:', plannerData);
+
+      let tasks: ExtractionTask[];
+      try {
+        if (plannerData.choices[0]?.message?.function_call?.arguments) {
+          // Parse the stringified arguments
+          console.log('Parsing function call arguments:', plannerData.choices[0].message.function_call.arguments);
+          const functionArgs = JSON.parse(plannerData.choices[0].message.function_call.arguments);
+          
+          if (!functionArgs.tasks || !Array.isArray(functionArgs.tasks)) {
+            throw new Error('Function response missing tasks array');
+          }
+          
+          tasks = functionArgs.tasks;
+          
+          // Validate that all fileIds match actual files
+          const validFileIds = sheets.map(s => s.fileId);
+          const invalidTasks = tasks.filter(t => !validFileIds.includes(t.fileId));
+          if (invalidTasks.length > 0) {
+            console.error('Invalid fileIds in tasks:', invalidTasks);
+            console.log('Valid fileIds are:', validFileIds);
+            throw new Error(`Tasks contain invalid fileIds. Got: ${invalidTasks.map(t => t.fileId).join(', ')}. Expected one of: ${validFileIds.join(', ')}`);
+          }
+        } else if (plannerData.choices[0]?.message?.content) {
+          const content = JSON.parse(plannerData.choices[0].message.content);
+          if (!content.tasks || !Array.isArray(content.tasks)) {
+            throw new Error('Message response missing tasks array');
+          }
+          tasks = content.tasks;
+        } else {
+          console.error('Invalid response structure:', plannerData.choices[0]);
+          throw new Error('Response missing valid message structure');
+        }
+        console.log('Parsed extraction tasks:', tasks);
+      } catch (error) {
+        console.error('Error parsing planner response:', error);
+        console.log('Raw planner data:', plannerData);
+        if (plannerData.choices[0]?.message?.function_call?.arguments) {
+          console.log('Raw function arguments:', plannerData.choices[0].message.function_call.arguments);
+        }
+        throw new Error(`Failed to parse planner response: ${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      // Extract data from each task
+      const extractedData: Record<string, ExtractedRecord[]> = {};
+      for (const task of tasks) {
+        console.log('Processing task:', task);
+        const sheet = sheets.find(
+          s => s.fileId === task.fileId && s.sheetId === task.sheetId
+        );
+        if (!sheet) {
+          console.warn('Sheet not found for task:', task);
+          continue;
+        }
+        
+        console.log('Calling GPT-4.1 for extraction...');
+        const extractorResponse = await fetch('/api/proxy/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${import.meta.env.VITE_OPENAI_KEY}`
+          },
+          body: JSON.stringify({
+            model: 'gpt-4.1',
+            max_tokens: 1000,
+            function_call: { name: "extract_records" },
+            response_format: { type: "json_object" },
+            functions: [{
+              name: "extract_records",
+              description: "Extract records from Excel sheet based on schema",
+              parameters: {
+                type: "object",
+                properties: {
+                  records: {
+                    type: "array",
+                    description: "Array of records with date and return values",
+                    items: {
+                      type: "object",
+                      required: ["date", "fund_x", "fund_y"],
+                      properties: {
+                        date: {
+                          type: "string",
+                          description: "Date in YYYY-MM format"
+                        },
+                        fund_x: {
+                          type: "number",
+                          description: "Return value for Fund X"
+                        },
+                        fund_y: {
+                          type: "number",
+                          description: "Return value for Fund Y"
+                        }
+                      }
+                    }
+                  }
+                },
+                required: ["records"]
+              }
+            }],
+            messages: [
+              {
+                role: 'system',
+                content: `You are a data extraction tool that looks at Excel sheets and returns structured JSON data.
+Look for columns containing dates and fund return values. The data should be organized by date (usually in rows) with separate columns for each fund's returns.
+Return the data as a JSON array of records, where each record has a date and the corresponding return values for the funds.
+Make sure to:
+1. Include ALL rows of actual data (skip headers, footers, and empty rows)
+2. Convert dates to YYYY-MM format
+3. Convert return values to numbers (remove any % signs)
+4. Return null if a value is missing
+
+Your response must be valid JSON in this exact format:
+{
+  "records": [
+    { "date": "YYYY-MM", "fund_x": number, "fund_y": number }
+  ]
+}`
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: `Extract the data needed to: "${task.purpose}". 
+Return the data as JSON in this exact format:
+{
+  "records": [
+    { "date": "YYYY-MM", "fund_x": number, "fund_y": number }
+  ]
+}`
+                  },
+                  {
+                    type: 'image_url',
+                    image_url: {
+                      url: sheet.pngUrl,
+                      detail: "high"
+                    }
+                  }
+                ]
+              }
+            ]
+          })
+        });
+
+        if (!extractorResponse.ok) {
+          throw new Error(`Extractor API error: ${extractorResponse.status} - ${await extractorResponse.text()}`);
+        }
+        
+        const extractorData = await extractorResponse.json();
+        console.log('Received extractor response:', extractorData);
+
+        let records: ExtractedRecord[];
+        try {
+          if (extractorData.choices[0]?.message?.function_call?.arguments) {
+            const args = extractorData.choices[0].message.function_call.arguments;
+            console.log('Parsing function arguments:', args);
+            if (args === '{}' || args === '') {
+              throw new Error('Extractor returned empty data');
+            }
+            const functionArgs = JSON.parse(args);
+            if (!functionArgs.records || !Array.isArray(functionArgs.records)) {
+              throw new Error('Function response missing records array');
+            }
+            records = functionArgs.records;
+          } else if (extractorData.choices[0]?.message?.content) {
+            const content = JSON.parse(extractorData.choices[0].message.content);
+            if (!content.records || !Array.isArray(content.records)) {
+              throw new Error('Message response missing records array');
+            }
+            records = content.records;
+          } else {
+            console.error('Invalid response structure:', extractorData.choices[0]);
+            throw new Error('Response missing valid message structure');
+          }
+          
+          if (records.length === 0) {
+            throw new Error('No records were extracted from the sheet');
+          }
+          
+          console.log('Parsed records:', records);
+        } catch (error) {
+          console.error('Error parsing extractor response:', error);
+          console.log('Raw extractor data:', extractorData);
+          throw new Error(`Failed to parse extractor response: ${error instanceof Error ? error.message : String(error)}`);
+        }
+
+        extractedData[`${task.fileId}_${task.sheetId}`] = records;
+      }
+      
+      // Register data with Pyodide
+      console.log('Registering data with Pyodide...');
+      for (const [key, records] of Object.entries(extractedData)) {
+        pyWorkerRef.current?.postMessage({
+          type: 'register',
+          name: key.replace(/[^a-z0-9]/gi, '_'),
+          records
+        });
+      }
+      
+      // Generate and execute Python code
+      console.log('Generating Python code...');
+      const codeGenResponse = await fetch('/api/proxy/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${import.meta.env.VITE_OPENAI_KEY}`
+        },
+        body: JSON.stringify({
+          model: 'gpt-4.1',
+          max_tokens: 1000,
+          function_call: { name: "generate_python_code" },
+          response_format: { type: "json_object" },
+          functions: [{
+            name: "generate_python_code",
+            description: "Generate Python code for data analysis",
+            parameters: {
+              type: "object",
+              properties: {
+                python: { type: "string" },
+                result_type: { 
+                  type: "string",
+                  enum: ["plot", "table", "value"]
+                }
+              },
+              required: ["python", "result_type"]
+            }
+          }],
+          messages: [
+            {
+              role: 'system',
+              content: `You are a Python code generation assistant that creates code to analyze data using pandas.
+DO NOT use plotly, matplotlib, or any other visualization packages - the visualization will be handled separately.
+Instead, focus on data preparation and return the processed DataFrame or computed values.
+
+For visualization tasks:
+1. Process the data (sort, filter, aggregate etc.)
+2. Return None to trigger the default visualization
+
+For analysis tasks:
+1. Return DataFrames for tabular data
+2. Return dictionaries/lists for computed values
+
+Return your response as a JSON object with:
+{
+  "python": "your code here",
+  "result_type": "plot" | "table" | "value"
+}
+
+The code should be complete and ready to execute.`
+            },
+            {
+              role: 'user',
+              content: `Generate Python code to ${message} using these dataframes: ${
+                Object.keys(extractedData)
+                  .map(k => k.replace(/[^a-z0-9]/gi, '_'))
+                  .join(', ')
+              }.
+
+The data has been loaded into pandas DataFrames with those exact names.
+Each dataframe has columns: date (YYYY-MM format), fund_x (number), fund_y (number).
+DO NOT use any visualization packages. Focus on data preparation and analysis.
+
+Return the code as JSON in this format:
+{
+  "python": "your code here",
+  "result_type": "plot"  # or "table" or "value" depending on output
+}`
+            }
+          ]
+        })
+      });
+
+      if (!codeGenResponse.ok) {
+        throw new Error(`Code generation API error: ${codeGenResponse.status} - ${await codeGenResponse.text()}`);
+      }
+      
+      const codeGenData = await codeGenResponse.json();
+      console.log('Received code generation response:', codeGenData);
+      
+      let codeGen: CodeGenResult;
+      try {
+        if (codeGenData.choices[0]?.message?.function_call?.arguments) {
+          const args = codeGenData.choices[0].message.function_call.arguments;
+          console.log('Parsing function arguments:', args);
+          if (args === '{}' || args === '') {
+            throw new Error('Code generator returned empty data');
+          }
+          codeGen = JSON.parse(args);
+        } else if (codeGenData.choices[0]?.message?.content) {
+          codeGen = JSON.parse(codeGenData.choices[0].message.content);
+        } else {
+          console.error('Invalid response structure:', codeGenData.choices[0]);
+          throw new Error('Response missing valid message structure');
+        }
+        
+        if (!codeGen.python || !codeGen.result_type) {
+          throw new Error('Generated code missing required fields');
+        }
+        
+        console.log('Generated code:', codeGen);
+        
+        // Execute the generated code
+        console.log('Executing Python code...');
+        pyWorkerRef.current?.postMessage({
+          type: 'exec',
+          code: codeGen.python,
+          resultType: codeGen.result_type,
+          dfName: `${task.fileId.replace(/[^a-z0-9]/gi, '_')}_${task.sheetId.replace(/[^a-z0-9]/gi, '_')}`
+        });
+      } catch (error) {
+        console.error('Error parsing code generation response:', error);
+        console.log('Raw code generation data:', codeGenData);
+        throw new Error(`Failed to parse code generation response: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      
+    } catch (error) {
+      console.error('Error processing request:', error);
+      setMessages(prev => [...prev, `Error: ${error instanceof Error ? error.message : String(error)}`]);
+    } finally {
+      setIsProcessing(false);
+    }
+  }, [sheets]);
+
+  const convertHTMLToPNG = useCallback(async (html: string, dims: { w: number; h: number }): Promise<string> => {
+    console.log('Converting HTML to PNG with dimensions:', dims);
+    const container = document.createElement('div');
+    container.innerHTML = html;
+    container.style.position = 'absolute';
+    container.style.left = '-9999px';
+    document.body.appendChild(container);
+
+    try {
+      console.log('Rendering with html2canvas...');
+      const canvas = await html2canvas(container, {
+        width: dims.w,
+        height: dims.h,
+        scale: 2, // For better resolution
+        logging: true // Enable html2canvas logging
+      });
+
+      document.body.removeChild(container);
+      const pngUrl = canvas.toDataURL('image/png');
+      console.log('HTML converted to PNG successfully');
+      return pngUrl;
+    } catch (error) {
+      document.body.removeChild(container);
+      console.error('Error converting HTML to PNG:', error);
+      throw new Error(`Failed to convert HTML to PNG: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, []);
+
+  // Initialize workers
+  useEffect(() => {
+    console.log('Initializing workers...');
+    
+    const renderWorker = new Worker(
+      new URL('../workers/render-worker.ts', import.meta.url),
+      { type: 'module' }
+    );
+    renderWorkerRef.current = renderWorker;
+    
+    renderWorker.onmessage = async (e) => {
+      console.log('Received message from render worker:', e.data);
+      try {
+        if (e.data.type === 'html') {
+          console.log('Processing HTML sheets:', e.data.sheetsData.length);
+          const sheets: SheetPNG[] = [];
+          
+          for (const sheetData of e.data.sheetsData) {
+            console.log(`Converting sheet to PNG: ${sheetData.sheetId}`);
+            const pngUrl = await convertHTMLToPNG(sheetData.html, sheetData.dims);
+            sheets.push({
+              fileId: sheetData.fileId,
+              sheetId: sheetData.sheetId,
+              pngUrl,
+              dims: sheetData.dims
+            });
+          }
+          
+          console.log('All sheets converted to PNG');
+          onSheetsUpdate(sheets);
+          setIsProcessing(false);
+        } else if (e.data.type === 'error') {
+          console.error('Render worker error:', e.data.error);
+          setMessages(prev => [...prev, `Error: ${e.data.error}`]);
+          setIsProcessing(false);
+        }
+      } catch (error) {
+        console.error('Error processing worker message:', error);
+        setMessages(prev => [...prev, `Error: ${error instanceof Error ? error.message : String(error)}`]);
+        setIsProcessing(false);
+      }
+    };
+
+    renderWorker.onerror = (e) => {
+      console.error('Render worker error event:', e);
+      setMessages(prev => [...prev, `Worker error: ${e.message}`]);
+      setIsProcessing(false);
+    };
+    
+    const pyWorker = new Worker(
+      new URL('../workers/py-worker.ts', import.meta.url),
+      { type: 'module' }
+    );
+    pyWorkerRef.current = pyWorker;
+    
+    pyWorker.onmessage = (e) => {
+      console.log('Received message from Python worker:', e.data);
+      if (e.data.type === 'result') {
+        // Forward the message to the WidgetGrid component
+        window.postMessage(e.data, window.location.origin);
+      }
+    };
+
+    pyWorker.onerror = (e) => {
+      console.error('Python worker error:', e);
+      setMessages(prev => [...prev, `Python worker error: ${e.message}`]);
+    };
+    
+    // Initialize Pyodide
+    console.log('Initializing Pyodide...');
+    pyWorker.postMessage({ type: 'init' });
+    
+    return () => {
+      console.log('Cleaning up workers...');
+      renderWorker.terminate();
+      pyWorker.terminate();
+    };
+  }, [onSheetsUpdate, setMessages, convertHTMLToPNG]);
+
+  return (
+    <div 
+      className="bg-white rounded-lg shadow p-4 h-[calc(100vh-8rem)] flex flex-col"
+      onDragOver={e => e.preventDefault()}
+      onDrop={handleFileDrop}
+    >
+      <div className="mb-4 flex items-center gap-4">
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+          disabled={isProcessing}
+        >
+          Upload Excel File
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".xlsx"
+          onChange={handleFileSelect}
+          className="hidden"
+          multiple
+        />
+        {isProcessing && (
+          <div className="text-gray-500">Processing...</div>
+        )}
+      </div>
+
+      {sheets.length > 0 && (
+        <div className="mb-4">
+          <details className="bg-gray-50 rounded-lg">
+            <summary className="cursor-pointer p-3 font-medium text-gray-700 hover:text-gray-900">
+              View Processed Sheets ({sheets.length})
+            </summary>
+            <div className="p-3 space-y-4">
+              {sheets.map((sheet, index) => (
+                <div key={`${sheet.fileId}_${sheet.sheetId}`} className="border rounded-lg p-3 bg-white">
+                  <div className="mb-2 font-medium text-gray-700">
+                    {sheet.fileId} - {sheet.sheetId}
+                  </div>
+                  <div className="overflow-auto">
+                    <img 
+                      src={sheet.pngUrl} 
+                      alt={`${sheet.fileId} - ${sheet.sheetId}`}
+                      className="max-w-full border rounded"
+                      style={{ maxHeight: '300px' }}
+                    />
+                  </div>
+                  <div className="mt-2 text-sm text-gray-500">
+                    Dimensions: {sheet.dims.w}x{sheet.dims.h}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </details>
+        </div>
+      )}
+
+      <div className="flex-1 overflow-y-auto space-y-4">
+        {messages.map((msg, i) => (
+          <div key={i} className="bg-gray-50 p-3 rounded">
+            {msg}
+          </div>
+        ))}
+      </div>
+      
+      <div className="mt-4 flex gap-2">
+        <input
+          type="text"
+          className="flex-1 border rounded px-3 py-2"
+          placeholder="Ask a question..."
+          onKeyDown={e => {
+            if (e.key === 'Enter' && !isProcessing) {
+              handleMessage(e.currentTarget.value);
+              e.currentTarget.value = '';
+            }
+          }}
+          disabled={isProcessing}
+        />
+      </div>
+    </div>
+  );
+} 
