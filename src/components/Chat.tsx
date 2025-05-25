@@ -74,43 +74,85 @@ export default function Chat({ sheets, onSheetsUpdate }: ChatProps) {
       const plannerPrompt = {
         model: 'gpt-4.1',
         max_tokens: 1000,
-        function_call: { name: "extract_tasks" },
         response_format: { type: "json_object" },
-        functions: [{
-          name: "extract_tasks",
-          description: "Extract tasks from Excel sheets based on user query",
-          parameters: {
-            type: "object",
-            properties: {
-              tasks: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    fileId: { type: "string" },
-                    sheetId: { type: "string" },
-                    purpose: { type: "string" },
-                    expectedSchema: { 
-                      type: "object",
-                      additionalProperties: { type: "string" }
-                    }
-                  },
-                  required: ["fileId", "sheetId", "purpose", "expectedSchema"]
+        functions: [
+          {
+            name: "extract_tasks",
+            description: "Extract tasks from Excel sheets based on user query. If the user does not specify a chart or table, infer the best way to present the answer (e.g., chart, table, or value) based on the question and the data. For each extraction task, specify the expected output type: 'plot', 'table', or 'value'. Make sure the extraction schema and task description are clear and will enable the code generation model to produce the correct output.",
+            parameters: {
+              type: "object",
+              properties: {
+                tasks: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      fileId: { type: "string" },
+                      sheetId: { type: "string" },
+                      purpose: { type: "string" },
+                      expectedSchema: { 
+                        type: "object",
+                        additionalProperties: { type: "string" }
+                      },
+                      outputType: {
+                        type: "string",
+                        enum: ["plot", "table", "value"],
+                        description: "The type of output best suited to answer the user's question."
+                      }
+                    },
+                    required: ["fileId", "sheetId", "purpose", "expectedSchema", "outputType"]
+                  }
                 }
-              }
-            },
-            required: ["tasks"]
+              },
+              required: ["tasks"]
+            }
+          },
+          {
+            name: "clarify_user_intent",
+            description: "If the user's query is ambiguous, missing information, or cannot be planned for, call this function. Return a message to the user explaining what additional information is needed to proceed.",
+            parameters: {
+              type: "object",
+              properties: {
+                clarification: { type: "string", description: "A message to the user explaining what is needed to continue." }
+              },
+              required: ["clarification"]
+            }
           }
-        }],
+        ],
         messages: [
           {
             role: 'system',
             content: `You are a planner that looks at screenshots of Excel sheets and creates a set of tasks that describe exactly what data should be extracted from which file and sheet in order to answer the user's question.
 
-Each task should explain:
+**IMPORTANT FUNCTION CALLING RULES:**
+- If the user's query is ambiguous, missing information, or cannot be planned for, you MUST call the clarify_user_intent function. Do NOT create an extraction task with a clarification or ambiguity in the purpose or any other field.
+- Only create extraction tasks when you have all the information needed to proceed.
+- Never use an extraction task to ask for clarification.
+
+**EXAMPLES:**
+
+# Good (clarification needed)
+Function call: clarify_user_intent
+Arguments: { "clarification": "Please specify which fund or year you want to analyze." }
+
+# Good (actionable extraction)
+Function call: extract_tasks
+Arguments: { "tasks": [ { "fileId": "PortfolioSummary.xlsx", "sheetId": "PortfolioSummary", "purpose": "Compare Fund X and Fund Y returns for 2022.", "expectedSchema": { "date": "yyyy-mm", "fund_x": "number", "fund_y": "number" }, "outputType": "plot" } ] }
+
+# Bad (do NOT do this)
+Function call: extract_tasks
+Arguments: { "tasks": [ { "fileId": "PortfolioSummary.xlsx", "sheetId": "PortfolioSummary", "purpose": "The user's request is ambiguous. Please specify which fund or year you want to analyze.", "expectedSchema": { "date": "yyyy-mm", "fund_x": "number", "fund_y": "number" }, "outputType": "table" } ] }
+
+**CONTRACT:**
+- If you need clarification, ONLY use clarify_user_intent.
+- If you have enough information, use extract_tasks.
+- Never use an extraction task to ask for clarification.
+
+For each extraction task, explain:
 - what the purpose of the data extraction is (what information you're trying to get),
 - which sheet the data is coming from (use the EXACT filename from the Excel file, e.g. "sample_funds.xlsx", NOT image names like "Sheet1.png"),
-- what the expected schema of the extracted data is (as a JSON object, where keys are column names and values are data types or formats).
+- what the expected schema of the extracted data is (as a JSON object, where keys are column names and values are data types or formats),
+- the outputType (plot, table, or value) that best suits the user's needs.
 
 Always output a list of extraction tasks as structured JSON. Make sure to use the exact Excel filenames from the uploaded files, not image names or generic names.`
           },
@@ -119,8 +161,7 @@ Always output a list of extraction tasks as structured JSON. Make sure to use th
             content: [
               {
                 type: 'text',
-                text: `The user wants to: "${message}". 
-Here are images of the Excel sheets they uploaded. The Excel filename is "${sheets[0].fileId}" with sheet "${sheets[0].sheetId}". Figure out what specific data we need to extract to answer their question, and return a list of clearly defined extraction tasks as JSON.`
+                text: `The user wants to: "${message}". \nHere are images of the Excel sheets they uploaded. The Excel filename is "${sheets[0].fileId}" with sheet "${sheets[0].sheetId}". Figure out what specific data we need to extract to answer their question, and return a list of clearly defined extraction tasks as JSON. If the user's query is ambiguous or missing information, call clarify_user_intent and tell the user what you need from them to continue.`
               },
               ...sheets.map(s => ({
                 type: 'image_url',
@@ -152,17 +193,28 @@ Here are images of the Excel sheets they uploaded. The Excel filename is "${shee
 
       let tasks: ExtractionTask[];
       try {
-        if (plannerData.choices[0]?.message?.function_call?.arguments) {
+        const functionCall = plannerData.choices[0]?.message?.function_call;
+        if (functionCall?.name === 'clarify_user_intent') {
+          // Handle clarification: show message to user and return early
+          let clarificationMsg = '';
+          try {
+            const args = functionCall.arguments;
+            clarificationMsg = typeof args === 'string' ? JSON.parse(args).clarification : args.clarification;
+          } catch (e) {
+            clarificationMsg = 'Sorry, I need more information to proceed.';
+          }
+          setMessages(prev => [...prev, clarificationMsg]);
+          setIsProcessing(false);
+          return;
+        }
+        if (functionCall?.name === 'extract_tasks' && functionCall?.arguments) {
           // Parse the stringified arguments
-          console.log('Parsing function call arguments:', plannerData.choices[0].message.function_call.arguments);
-          const functionArgs = JSON.parse(plannerData.choices[0].message.function_call.arguments);
-          
+          console.log('Parsing function call arguments:', functionCall.arguments);
+          const functionArgs = JSON.parse(functionCall.arguments);
           if (!functionArgs.tasks || !Array.isArray(functionArgs.tasks)) {
             throw new Error('Function response missing tasks array');
           }
-          
           tasks = functionArgs.tasks;
-          
           // Validate that all fileIds match actual files
           const validFileIds = sheets.map(s => s.fileId);
           const invalidTasks = tasks.filter(t => !validFileIds.includes(t.fileId));
@@ -188,7 +240,9 @@ Here are images of the Excel sheets they uploaded. The Excel filename is "${shee
         if (plannerData.choices[0]?.message?.function_call?.arguments) {
           console.log('Raw function arguments:', plannerData.choices[0].message.function_call.arguments);
         }
-        throw new Error(`Failed to parse planner response: ${error instanceof Error ? error.message : String(error)}`);
+        setMessages(prev => [...prev, `Error: ${error instanceof Error ? error.message : String(error)}`]);
+        setIsProcessing(false);
+        return;
       }
 
       // Extract data from each task
@@ -251,6 +305,23 @@ Here are images of the Excel sheets they uploaded. The Excel filename is "${shee
               {
                 role: 'system',
                 content: `You are a data extraction tool that looks at Excel sheets and returns structured JSON data.
+
+**IMPORTANT:**
+- You MUST return ONLY valid JSON, with no extra text, markdown, or explanation.
+- Do NOT include any text before or after the JSON.
+- Do NOT use markdown code blocks.
+- Do NOT return multiple JSON objects.
+- Our system will only parse the first valid JSON object. Any extra text will cause an error.
+
+# Good
+{ "records": [ ... ] }
+
+# Bad (DO NOT do this)
+Here is the JSON:
+\`\`\`json
+{ "records": [ ... ] }
+\`\`\`
+
 Look for columns containing dates and fund return values. The data should be organized by date (usually in rows) with separate columns for each fund's returns.
 Return the data as a JSON array of records, where each record has a date and the corresponding return values for the funds.
 Make sure to:
@@ -347,6 +418,12 @@ Return the data as JSON in this exact format:
         });
       }
       
+      // Build environment context string for codegen prompt
+      const envContext = Object.entries(extractedData).map(([varName, records]) => {
+        const cols = records && records[0] ? Object.keys(records[0]).join(', ') : '(unknown columns)';
+        return `- ${varName}: pandas DataFrame loaded from the extracted data. Columns: ${cols}`;
+      }).join('\n');
+
       // Generate and execute Python code
       console.log('Generating Python code...');
       const codeGenResponse = await fetch('/api/proxy/v1/chat/completions', {
@@ -378,25 +455,56 @@ Return the data as JSON in this exact format:
           messages: [
             {
               role: 'system',
-              content: `You are a Python code generation assistant that creates code to analyze data using pandas.
-DO NOT use plotly, matplotlib, or any other visualization packages - the visualization will be handled separately.
-Instead, focus on data preparation and return the processed DataFrame or computed values.
-
-For visualization tasks:
-1. Process the data (sort, filter, aggregate etc.)
-2. Return None to trigger the default visualization
-
-For analysis tasks:
-1. Return DataFrames for tabular data
-2. Return dictionaries/lists for computed values
-
-Return your response as a JSON object with:
-{
-  "python": "your code here",
-  "result_type": "plot" | "table" | "value"
-}
-
-The code should be complete and ready to execute.`
+              content:
+                'You are a Python code generation assistant for in-browser data analysis.\n' +
+                '# Environment context:\n' +
+                envContext + '\n' +
+                '\nYour job:\n' +
+                '- Write Python code to analyze or visualize the provided DataFrame(s) as requested by the user.\n' +
+                '- The DataFrame(s) are already loaded and available as variables (see above).\n' +
+                '- The code will be executed in a secure, sandboxed environment (Pyodide) with only pandas and numpy available.\n' +
+                '\n**IMPORTANT:**\n' +
+                '- Use the DataFrame variable(s) listed above.\n' +
+                "- DO NOT reference a variable named 'data' unless it is explicitly defined.\n" +
+                "- 'data' is NOT defined by default.\n" +
+                "- You MUST assign your final output to a variable named 'result'. Our system will ONLY look for a variable named 'result' to return to the user. If you do not assign to 'result', your code will not work.\n" +
+                '\nRules and Guardrails:\n' +
+                "- DO NOT use 'import' statements except for pandas/numpy (which are already imported).\n" +
+                "- DO NOT use 'open', 'os', 'sys', 'subprocess', 'requests', or any file/network/system operations.\n" +
+                "- DO NOT use infinite loops or recursion.\n" +
+                "- DO NOT use 'input', 'print', or any interactive functions.\n" +
+                "- DO NOT use plotting libraries except for returning a Plotly figure dict (do not import plotly).\n" +
+                "- DO NOT mutate global state.\n" +
+                "- DO NOT use 'exit', 'quit', or similar.\n" +
+                "- DO NOT use 'eval' or 'exec'.\n" +
+                '\nContract:\n' +
+                "- Always assign your final output to a variable named 'result'.\n" +
+                "- 'result' must be one of:\n" +
+                "    - A Plotly figure dict (for charting)\n" +
+                "    - A pandas DataFrame (for tables)\n" +
+                "    - A scalar value (for single-value answers)\n" +
+                "- 'result' must be JSON-serializable.\n" +
+                "- If the user asks for a chart, return a Plotly figure dict as 'result'.\n" +
+                "- If the user asks for a table, return a DataFrame as 'result'.\n" +
+                "- If the user asks for a value, return a scalar as 'result'.\n" +
+                '\nExamples:\n' +
+                '\n# Good (Bar chart, using df)\n' +
+                "result = {\n    'data': [\n        {\n            'type': 'bar',\n            'x': df['year'].tolist(),\n            'y': df['sales'].tolist(),\n            'name': 'Sales'\n        }\n    ],\n    'layout': {\n        'title': 'Sales by Year',\n        'xaxis': {'title': 'Year'},\n        'yaxis': {'title': 'Sales'}\n    }\n}\n" +
+                '\n# Good (Table, using df)\n' +
+                "result = df[['year', 'sales']]\n" +
+                '\n# Good (Value, using df)\n' +
+                "result = df['sales'].sum()\n" +
+                '\n# Bad (DO NOT do this, \'data\' is not defined)\n' +
+                "result = data['sales']  # ERROR: 'data' is not defined. Use 'df' instead.\n" +
+                '# print(df)\n' +
+                '# open(\'file.txt\', \'w\')\n' +
+                '# import os\n' +
+                '# result = None\n' +
+                '\n# Bad (DO NOT do this, bare expression will not work)\n' +
+                'yoy_comparison  # ERROR: This does not assign to result. You must write: result = yoy_comparison\n' +
+                '\nUser request: ' + message + '\n' +
+                '\nDataFrames available: ' + Object.keys(extractedData).map(k => k.replace(/[^a-z0-9]/gi, '_')).join(', ') + '\n' +
+                '\nNow, write the code.'
             },
             {
               role: 'user',
@@ -404,17 +512,7 @@ The code should be complete and ready to execute.`
                 Object.keys(extractedData)
                   .map(k => k.replace(/[^a-z0-9]/gi, '_'))
                   .join(', ')
-              }.
-
-The data has been loaded into pandas DataFrames with those exact names.
-Each dataframe has columns: date (YYYY-MM format), fund_x (number), fund_y (number).
-DO NOT use any visualization packages. Focus on data preparation and analysis.
-
-Return the code as JSON in this format:
-{
-  "python": "your code here",
-  "result_type": "plot"  # or "table" or "value" depending on output
-}`
+              }.\n\nThe data has been loaded into pandas DataFrames with those exact names.\nEach dataframe has columns: ${Object.keys(extractedData).map(k => extractedData[k][0] ? Object.keys(extractedData[k][0]).join(', ') : '').join(' | ')}.\nDO NOT use any visualization packages. Focus on data preparation and analysis.\n\nReturn the code as JSON in this format:\n{\n  "python": "your code here",\n  "result_type": "plot"  # or "table" or "value" depending on output\n}`
             }
           ]
         })

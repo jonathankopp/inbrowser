@@ -26,8 +26,18 @@ export default function WidgetGrid() {
           // Clear existing plot
           plotContainerRef.current.innerHTML = '';
           
-          // Parse the Plotly figure JSON and render it
-          const figure = JSON.parse(payload);
+          // Accept both stringified and object payloads
+          let figure;
+          if (typeof payload === 'string') {
+            try {
+              figure = JSON.parse(payload);
+            } catch (e) {
+              console.error('Failed to parse plot payload as JSON:', e, payload);
+              return;
+            }
+          } else {
+            figure = payload;
+          }
           console.log('Rendering plot with data:', figure);
           
           if (!figure.data || !figure.layout) {
