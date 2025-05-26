@@ -4,7 +4,16 @@ import type { SheetPNG } from '../types';
 const sheetToHTML = (sheet: XLSX.WorkSheet): string => {
   console.log('Converting sheet to HTML...');
   try {
-    const html = XLSX.utils.sheet_to_html(sheet, { id: 'sheet-table' });
+    let html = XLSX.utils.sheet_to_html(sheet, { id: 'sheet-table' });
+    // Inject basic gridline styling so the screenshot looks like Excel with gridlines
+    const styleTag = `<style>
+      table#sheet-table { border-collapse: collapse; }
+      table#sheet-table td, table#sheet-table th {
+        border: 1px solid #d0d0d0;
+        padding: 2px 4px;
+      }
+    </style>`;
+    html = styleTag + html;
     console.log('Sheet converted to HTML successfully');
     return html;
   } catch (error) {

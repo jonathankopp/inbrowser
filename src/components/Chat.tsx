@@ -132,6 +132,15 @@ export default function Chat({ sheets, onSheetsUpdate }: ChatProps) {
 
 **EXAMPLES:**
 
+# Good (multiple sheets)
+Function call: extract_tasks
+Arguments: {
+  "tasks": [
+    { "fileId": "financials.xlsx", "sheetId": "2024", "purpose": "Get January 2024 profit", "expectedSchema": { "month": "string", "profit": "number" }, "outputType": "value" },
+    { "fileId": "financials.xlsx", "sheetId": "2025", "purpose": "Get January 2025 profit", "expectedSchema": { "month": "string", "profit": "number" }, "outputType": "value" }
+  ]
+}
+
 # Good (clarification needed)
 Function call: clarify_user_intent
 Arguments: { "clarification": "Your request for a chart is ambiguous. Please specify the type of chart you want (e.g., grouped bar chart, stacked bar chart, line chart) and how you want the comparison to be shown. For example, you can ask: 'Show me a grouped bar chart comparing Direct Loans, FFEL, and Perkins Loans for each year.'" }
@@ -159,7 +168,67 @@ For each extraction task, explain:
 - what the expected schema of the extracted data is (as a JSON object, where keys are column names and values are data types or formats),
 - the outputType (plot, table, or value) that best suits the user's needs.
 
-Always output a list of extraction tasks as structured JSON. Make sure to use the exact Excel filenames from the uploaded files, not image names or generic names.`
+Always output a list of extraction tasks as structured JSON. Make sure to use the exact Excel filenames from the uploaded files, not image names or generic names.
+
+6. If the sheet name (sheetId) is or contains a four-digit year (e.g., "2024", "2025"), only include rows where the date's year matches that sheet's year. Skip rows for other years to avoid mixing data between sheets.
+
+5. Use the actual column names from the table header as labels (NOT generic descriptions like "Value" or "Amount")
+
+7. If a cell in the Month column contains a string with slashes (e.g. "5/1/24"),
+   interpret it as m/d/yy (US style) → 2024-05-01, not d/m/yy.
+   Then convert to YYYY-MM.
+
+8. Cells that contain only the month name ("January", "February", …) belong to
+   that month of the sheet's year.  For example on sheet "2024",
+   "January" → 2024-01.
+
+For each extraction task, explain:
+- what the purpose of the data extraction is (what information you're trying to get),
+- which sheet the data is coming from (use the EXACT filename from the Excel file, e.g. "sample_funds.xlsx", NOT image names like "Sheet1.png"),
+- what the expected schema of the extracted data is (as a JSON object, where keys are column names and values are data types or formats),
+- the outputType (plot, table, or value) that best suits the user's needs.
+
+Always output a list of extraction tasks as structured JSON. Make sure to use the exact Excel filenames from the uploaded files, not image names or generic names.
+
+6. If the sheet name (sheetId) is or contains a four-digit year (e.g., "2024", "2025"), only include rows where the date's year matches that sheet's year. Skip rows for other years to avoid mixing data between sheets.
+
+5. Use the actual column names from the table header as labels (NOT generic descriptions like "Value" or "Amount")
+
+6. Date/Month parsing rules:
+   - If a cell in the month/date column contains only a month name ("January", "Feb", etc.), combine it with the sheet's year (if the sheet name looks like a year) to build the date (e.g., sheet "2024" + "January" -> "2024-01").
+   - If the cell contains a slash-separated string like "5/1/24" or "05/01/24", assume U.S. month/day/year order (m/d/yy). Use the first number as the month.
+   - After parsing, always output the date as YYYY-MM (no day component).
+   - Do NOT mis-label May (5/1/24) as January.
+   - Do NOT fabricate rows; only return the rows that exist in the sheet.
+
+For each extraction task, explain:
+- what the purpose of the data extraction is (what information you're trying to get),
+- which sheet the data is coming from (use the EXACT filename from the Excel file, e.g. "sample_funds.xlsx", NOT image names like "Sheet1.png"),
+- what the expected schema of the extracted data is (as a JSON object, where keys are column names and values are data types or formats),
+- the outputType (plot, table, or value) that best suits the user's needs.
+
+Always output a list of extraction tasks as structured JSON. Make sure to use the exact Excel filenames from the uploaded files, not image names or generic names.
+
+6. If the sheet name (sheetId) is or contains a four-digit year (e.g., "2024", "2025"), only include rows where the date's year matches that sheet's year. Skip rows for other years to avoid mixing data between sheets.
+
+5. Use the actual column names from the table header as labels (NOT generic descriptions like "Value" or "Amount")
+
+6. ABSOLUTE RULE: When the sheet name **is** a 4-digit year
+  (e.g. "2025") and the month cell lacks a year, you **MUST**
+  use the sheet's year.  For sheet "2025", "January" → "2025-01".
+  Never guess a different year.
+
+For each extraction task, explain:
+- what the purpose of the data extraction is (what information you're trying to get),
+- which sheet the data is coming from (use the EXACT filename from the Excel file, e.g. "sample_funds.xlsx", NOT image names like "Sheet1.png"),
+- what the expected schema of the extracted data is (as a JSON object, where keys are column names and values are data types or formats),
+- the outputType (plot, table, or value) that best suits the user's needs.
+
+Always output a list of extraction tasks as structured JSON. Make sure to use the exact Excel filenames from the uploaded files, not image names or generic names.
+
+6. If the sheet name (sheetId) is or contains a four-digit year (e.g., "2024", "2025"), only include rows where the date's year matches that sheet's year. Skip rows for other years to avoid mixing data between sheets.
+
+5. Use the actual column names from the table header as labels (NOT generic descriptions like "Value" or "Amount")`
           },
           {
             role: 'user',
@@ -392,22 +461,7 @@ Your response must be valid JSON in this exact format:
                 content: [
                   {
                     type: 'text',
-                    text: `Extract the data needed to: "${task.purpose}". 
-Return the data as JSON with this structure (example with 2 numeric columns, but include **all** numeric columns you find):
-{
-  "records": [
-    {
-      "date": "YYYY-MM",
-      "col_a": { "value": number, "label": "Actual Column Name" },
-      "col_b": { "value": number, "label": "Actual Column Name" }
-    }
-  ]
-}
-
-Guidelines:
-- Use the column header text (sanitized to snake_case) as the key (e.g., "Direct Loans" -> "direct_loans").
-- Include one object per row of data.
-- Only the "date" property is guaranteed; all other properties depend on the columns you detect.`
+                    text: `Extract the data needed to: "${task.purpose}". \nReturn the data as JSON with this structure (example with 2 numeric columns, but include **all** numeric columns you find):\n{\n  \"records\": [\n    {\n      \"date\": \"YYYY-MM\",\n      \"col_a\": { \"value\": number, \"label\": \"Actual Column Name\" },\n      \"col_b\": { \"value\": number, \"label\": \"Actual Column Name\" }\n    }\n  ]\n}\n\nGuidelines:\n- Use the column header text (sanitized to snake_case) as the key (e.g., \"Direct Loans\" -> \"direct_loans\").\n- Include one object per row of data.\n- Only the \"date\" property is guaranteed; all other properties depend on the columns you detect.${/^\d{4}$/.test(task.sheetId) ? `\n- This sheet is named \"${task.sheetId}\"; if month cells contain no year, assume the year ${task.sheetId}.` : ''}`
                   },
                   {
                     type: 'image_url',
@@ -461,6 +515,24 @@ Guidelines:
           
           console.log('Parsed records:', records);
           console.log('Parsed column labels:', columnLabels);
+
+          // --- Post-process dates based on sheet year ---------------------------------
+          const sheetYearMatch = /^\d{4}$/.test(task.sheetId) ? parseInt(task.sheetId, 10) : null;
+          if (sheetYearMatch) {
+            records = records.map(rec => {
+              const y = parseInt((rec.date ?? '').substring(0, 4));
+              if (isNaN(y) || y !== sheetYearMatch) {
+                // keep month component, override year
+                const monthPart = rec.date?.substring(5) ?? '01';
+                return { ...rec, date: `${sheetYearMatch}-${monthPart}` } as ExtractedRecord;
+              }
+              return rec;
+            }).filter(r => {
+              // drop rows where all numeric values are null (e.g., placeholder rows)
+              return Object.entries(r).some(([k, v]) => k !== 'date' && typeof v === 'object' && v.value !== null);
+            });
+            console.log('Post-processed records:', records);
+          }
         } catch (error) {
           console.error('Error parsing extractor response:', error);
           console.log('Raw extractor data:', extractorData);
