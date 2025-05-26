@@ -14,7 +14,17 @@ export type ExtractionTask = {
   expectedSchema: Record<string, 'yyyy-mm' | 'number' | string>;
 };
 
-export type ExtractedRecord = Record<string, string | number>;
+export interface ExtractedRecord {
+  date: string;
+  fund_x: {
+    value: number;
+    label: string;
+  };
+  fund_y: {
+    value: number;
+    label: string;
+  };
+}
 
 export type CodeGenResult = {
   python: string;

@@ -128,12 +128,17 @@ export default function Chat({ sheets, onSheetsUpdate }: ChatProps) {
 - If the user's query is ambiguous, missing information, or cannot be planned for, you MUST call the clarify_user_intent function. Do NOT create an extraction task with a clarification or ambiguity in the purpose or any other field.
 - Only create extraction tasks when you have all the information needed to proceed.
 - Never use an extraction task to ask for clarification.
+- If the user's request for a chart or comparison is ambiguous (e.g., "show me a chart" or "compare X and Y" without specifying the chart type or grouping), call clarify_user_intent and suggest specific chart types or comparison styles the user could ask for. Use the context of their question to make relevant suggestions.
 
 **EXAMPLES:**
 
 # Good (clarification needed)
 Function call: clarify_user_intent
-Arguments: { "clarification": "Please specify which fund or year you want to analyze." }
+Arguments: { "clarification": "Your request for a chart is ambiguous. Please specify the type of chart you want (e.g., grouped bar chart, stacked bar chart, line chart) and how you want the comparison to be shown. For example, you can ask: 'Show me a grouped bar chart comparing Direct Loans, FFEL, and Perkins Loans for each year.'" }
+
+# Good (clarification needed, context-aware)
+Function call: clarify_user_intent
+Arguments: { "clarification": "You asked to compare loan types year-over-year, but did not specify the chart type. Please specify if you want a grouped bar chart, stacked bar chart, or line chart. For example: 'Show me a grouped bar chart comparing each loan type by year.'" }
 
 # Good (actionable extraction)
 Function call: extract_tasks
@@ -247,6 +252,7 @@ Always output a list of extraction tasks as structured JSON. Make sure to use th
 
       // Extract data from each task
       const extractedData: Record<string, ExtractedRecord[]> = {};
+      let columnLabels: Record<string, string> = {};
       for (const task of tasks) {
         console.log('Processing task:', task);
         const sheet = sheets.find(
@@ -266,7 +272,7 @@ Always output a list of extraction tasks as structured JSON. Make sure to use th
           },
           body: JSON.stringify({
             model: 'gpt-4.1',
-            max_tokens: 1000,
+            max_tokens: 32_768,
             function_call: { name: "extract_records" },
             response_format: { type: "json_object" },
             functions: [{
@@ -277,23 +283,30 @@ Always output a list of extraction tasks as structured JSON. Make sure to use th
                 properties: {
                   records: {
                     type: "array",
-                    description: "Array of records with date and return values",
+                    description: "Array of records with date and numeric values (each column is an object with value and label)",
                     items: {
                       type: "object",
-                      required: ["date", "fund_x", "fund_y"],
+                      required: ["date"],
                       properties: {
                         date: {
                           type: "string",
                           description: "Date in YYYY-MM format"
-                        },
-                        fund_x: {
-                          type: "number",
-                          description: "Return value for Fund X"
-                        },
-                        fund_y: {
-                          type: "number",
-                          description: "Return value for Fund Y"
                         }
+                      },
+                      additionalProperties: {
+                        type: "object",
+                        description: "A numeric column with its value and label",
+                        properties: {
+                          value: {
+                            type: "number",
+                            description: "The numeric value from the column"
+                          },
+                          label: {
+                            type: "string",
+                            description: "The actual column name from the table header"
+                          }
+                        },
+                        required: ["value", "label"]
                       }
                     }
                   }
@@ -314,7 +327,22 @@ Always output a list of extraction tasks as structured JSON. Make sure to use th
 - Our system will only parse the first valid JSON object. Any extra text will cause an error.
 
 # Good
-{ "records": [ ... ] }
+{
+  "records": [
+    {
+      "date": "2020-01",
+      "col_a": { "value": 123.4, "label": "First Column Name" },
+      "col_b": { "value": 234.5, "label": "Second Column Name" },
+      "col_c": { "value": 8.2, "label": "Third Column Name" }
+    },
+    {
+      "date": "2020-02",
+      "col_a": { "value": 125.0, "label": "First Column Name" },
+      "col_b": { "value": 236.0, "label": "Second Column Name" },
+      "col_c": { "value": 8.1, "label": "Third Column Name" }
+    }
+  ]
+}
 
 # Bad (DO NOT do this)
 Here is the JSON:
@@ -322,18 +350,40 @@ Here is the JSON:
 { "records": [ ... ] }
 \`\`\`
 
-Look for columns containing dates and fund return values. The data should be organized by date (usually in rows) with separate columns for each fund's returns.
-Return the data as a JSON array of records, where each record has a date and the corresponding return values for the funds.
+# Bad (DO NOT do this - wrong labels)
+{
+  "records": [
+    {
+      "date": "2020-01",
+      "col_a": { "value": 123.4, "label": "Value (in billions)" },
+      "col_b": { "value": 234.5, "label": "Value (in billions)" }
+    }
+  ]
+}
+
+Look for columns containing dates and numeric values. The data should be organized by date (usually in rows) with separate columns for each value series.
+Return the data as a JSON array of records, where each record has:
+1. A date in YYYY-MM format
+2. For each numeric column:
+   - A value (the numeric value from the column)
+   - A label (the actual column name from the table header)
+
 Make sure to:
 1. Include ALL rows of actual data (skip headers, footers, and empty rows)
 2. Convert dates to YYYY-MM format
-3. Convert return values to numbers (remove any % signs)
+3. Convert values to numbers (remove any % signs or other formatting)
 4. Return null if a value is missing
+5. Use the actual column names from the table header as labels (NOT generic descriptions like "Value" or "Amount")
 
 Your response must be valid JSON in this exact format:
 {
   "records": [
-    { "date": "YYYY-MM", "fund_x": number, "fund_y": number }
+    {
+      "date": "YYYY-MM",
+      "col_a": { "value": number, "label": "Actual Column Name" },
+      "col_b": { "value": number, "label": "Actual Column Name" },
+      "col_c": { "value": number, "label": "Actual Column Name" }
+    }
   ]
 }`
               },
@@ -343,12 +393,21 @@ Your response must be valid JSON in this exact format:
                   {
                     type: 'text',
                     text: `Extract the data needed to: "${task.purpose}". 
-Return the data as JSON in this exact format:
+Return the data as JSON with this structure (example with 2 numeric columns, but include **all** numeric columns you find):
 {
   "records": [
-    { "date": "YYYY-MM", "fund_x": number, "fund_y": number }
+    {
+      "date": "YYYY-MM",
+      "col_a": { "value": number, "label": "Actual Column Name" },
+      "col_b": { "value": number, "label": "Actual Column Name" }
+    }
   ]
-}`
+}
+
+Guidelines:
+- Use the column header text (sanitized to snake_case) as the key (e.g., "Direct Loans" -> "direct_loans").
+- Include one object per row of data.
+- Only the "date" property is guaranteed; all other properties depend on the columns you detect.`
                   },
                   {
                     type: 'image_url',
@@ -383,12 +442,14 @@ Return the data as JSON in this exact format:
               throw new Error('Function response missing records array');
             }
             records = functionArgs.records;
+            columnLabels = functionArgs.column_labels || {};
           } else if (extractorData.choices[0]?.message?.content) {
             const content = JSON.parse(extractorData.choices[0].message.content);
             if (!content.records || !Array.isArray(content.records)) {
               throw new Error('Message response missing records array');
             }
             records = content.records;
+            columnLabels = content.column_labels || {};
           } else {
             console.error('Invalid response structure:', extractorData.choices[0]);
             throw new Error('Response missing valid message structure');
@@ -399,6 +460,7 @@ Return the data as JSON in this exact format:
           }
           
           console.log('Parsed records:', records);
+          console.log('Parsed column labels:', columnLabels);
         } catch (error) {
           console.error('Error parsing extractor response:', error);
           console.log('Raw extractor data:', extractorData);
@@ -411,18 +473,40 @@ Return the data as JSON in this exact format:
       // Register data with Pyodide
       console.log('Registering data with Pyodide...');
       for (const [key, records] of Object.entries(extractedData)) {
+        const processedRecords = records.map(r => {
+          const processed: Record<string, any> = { date: r.date };
+          // Process each column dynamically
+          Object.entries(r).forEach(([colName, value]) => {
+            if (colName !== 'date' && typeof value === 'object' && 'value' in value) {
+              processed[colName] = value.value;
+            }
+          });
+          return processed;
+        });
         pyWorkerRef.current?.postMessage({
           type: 'register',
           name: key.replace(/[^a-z0-9]/gi, '_'),
-          records
+          records: processedRecords
         });
       }
       
       // Build environment context string for codegen prompt
       const envContext = Object.entries(extractedData).map(([varName, records]) => {
-        const cols = records && records[0] ? Object.keys(records[0]).join(', ') : '(unknown columns)';
+        const first = records[0];
+        const cols = first ? [
+          'date',
+          ...Object.entries(first)
+            .filter(([key, value]) => key !== 'date' && typeof value === 'object' && 'value' in value)
+            .map(([key, value]) => `${key} (${(value as {label: string}).label})`)
+        ].join(', ') : '(unknown columns)';
         return `- ${varName}: pandas DataFrame loaded from the extracted data. Columns: ${cols}`;
       }).join('\n');
+      // Pass columnLabels mapping to codegen
+      const columnLabelsContext = Object.keys(columnLabels).length > 0
+        ? 'When generating plots or tables, use the following mapping for column labels:\n' +
+          Object.entries(columnLabels).map(([k, v]) => `${k} = "${v}"`).join('\n') +
+          '\nAlways use these names in chart titles, axis labels, and legends.'
+        : '';
 
       // Generate and execute Python code
       console.log('Generating Python code...');
@@ -459,6 +543,7 @@ Return the data as JSON in this exact format:
                 'You are a Python code generation assistant for in-browser data analysis.\n' +
                 '# Environment context:\n' +
                 envContext + '\n' +
+                (columnLabelsContext ? '\n' + columnLabelsContext + '\n' : '') +
                 '\nYour job:\n' +
                 '- Write Python code to analyze or visualize the provided DataFrame(s) as requested by the user.\n' +
                 '- The DataFrame(s) are already loaded and available as variables (see above).\n' +
@@ -495,7 +580,7 @@ Return the data as JSON in this exact format:
                 '\n# Good (Value, using df)\n' +
                 "result = df['sales'].sum()\n" +
                 '\n# Bad (DO NOT do this, \'data\' is not defined)\n' +
-                "result = data['sales']  # ERROR: 'data' is not defined. Use 'df' instead.\n" +
+                "result = df['sales']  # ERROR: 'data' is not defined. Use 'df' instead.\n" +
                 '# print(df)\n' +
                 '# open(\'file.txt\', \'w\')\n' +
                 '# import os\n' +

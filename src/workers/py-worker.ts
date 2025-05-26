@@ -27,11 +27,17 @@ self.onmessage = async ({ data }) => {
     
     if (data.type === 'register') {
       const { name, records } = data;
-      console.log(`Registering dataframe '${name}' with ${records.length} records`);
+      // Ensure fund_x and fund_y are numbers (not objects)
+      const processedRecords = records.map((r: any) => ({
+        ...r,
+        fund_x: typeof r.fund_x === 'object' ? r.fund_x.value : r.fund_x,
+        fund_y: typeof r.fund_y === 'object' ? r.fund_y.value : r.fund_y
+      }));
+      console.log(`Registering dataframe '${name}' with ${processedRecords.length} records`);
       try {
         const code = `
 import json, pandas as pd
-df_data = json.loads('''${JSON.stringify(records)}''')
+df_data = json.loads('''${JSON.stringify(processedRecords)}''')
 df = pd.DataFrame(df_data)
 globals()['${name}'] = df
 print(f"Created dataframe with shape: {df.shape}")
