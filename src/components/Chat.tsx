@@ -166,7 +166,7 @@ Always output a list of extraction tasks as structured JSON. Make sure to use th
             content: [
               {
                 type: 'text',
-                text: `The user wants to: "${message}". \nHere are images of the Excel sheets they uploaded. The Excel filename is "${sheets[0].fileId}" with sheet "${sheets[0].sheetId}". Figure out what specific data we need to extract to answer their question, and return a list of clearly defined extraction tasks as JSON. If the user's query is ambiguous or missing information, call clarify_user_intent and tell the user what you need from them to continue.`
+                text: `The user wants to: "${message}".\nHere are images of ALL the Excel sheets they uploaded:\n${sheets.map(s => `- File: ${s.fileId}, Sheet: ${s.sheetId}`).join("\n")}\nFigure out which file(s) and sheet(s) contain the data needed, create the extraction task(s) accordingly, and return them as JSON. If the user's query is ambiguous or missing information, call clarify_user_intent and tell the user what you need from them to continue.`
               },
               ...sheets.map(s => ({
                 type: 'image_url',
